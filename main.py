@@ -1,11 +1,11 @@
 """
 Elections scraper (PS 2017 NSS, volby.cz)
 
-Run:
+Usage:
   python main.py <URL_UZEMNIHO_CELKU> <OUTPUT.csv>
 
-Example (tvůj odkaz "sem"):
-  python main.py "https://volby.cz/pls/ps2017nss/ps32?xjazyk=CZ&xkraj=2&xnumnuts=2101" vysledky.csv
+Example:
+  python main.py "https://www.volby.cz/pls/ps2017nss/ps32?xjazyk=CZ&xkraj=2&xnumnuts=2101" vysledky.csv
 """
 
 from __future__ import annotations
@@ -18,66 +18,26 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; elections-scraper/1.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; engeto-elections-scraper/1.0)"}
 TIMEOUT = 20
 
 
 def fetch_soup(url: str) -> BeautifulSoup:
-    """Download URL and return BeautifulSoup."""
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    """Download URL and return parsed HTML."""
+    r = requests.get(url, headers=UA, timeout=TIMEOUT)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
-def clean_int(text: str) -> int:
-    """Convert numbers like '1 234', '1\xa0234' or '100,00' to int."""
-    s = text.replace("\xa0", "").replace(" ", "").strip()
-    if not s:
-        return 0
-    # handle european decimals like 100,00
-    if "," in s and s.replace(",", "").isdigit():
-        s = s.split(",", 1)[0]
-        return int(s) if s else 0
-    # handle unexpected non-digits safely
-    s = "".join(ch for ch in s if ch.isdigit())
-    return int(s) if s else 0
 
-
-
-def find_muni_link(tr: BeautifulSoup, base_url: str) -> str:
-    """
-    Find link to municipality results from row:
-    - prefer link in column "Číslo" (usually first TD with digit link)
-    - fallback: link in column "Výběr okrsku" (X)
-    """
-    tds = tr.find_all("td")
-    if not tds:
-        return ""
-
-    # Prefer: first <a> whose text is municipality code (digits)
-    for td in tds[:2]:
-        a = td.find("a")
-        if a and a.get_text(strip=True).isdigit() and a.get("href"):
-            return urljoin(base_url, a["href"])
-
-    # Fallback: any "X" link in the row (Výběr okrsku)
-    for a in tr.find_all("a"):
-        if a.get_text(strip=True).upper() == "X" and a.get("href"):
-            return urljoin(base_url, a["href"])
-
-    # Last fallback: any link that looks like municipality results
-    for a in tr.find_all("a"):
-        href = a.get("href", "")
-        if href and ("ps311" in href or "ps32" in href):
-            return urljoin(base_url, href)
-
-    return ""
+def to_digits(text: str) -> str:
+    """Return only digits from text (keeps 0-9)."""
+    return "".join(ch for ch in text.replace("\xa0", "").replace(" ", "") if ch.isdigit())
 
 
 def parse_municipalities(unit_url: str) -> List[Tuple[str, str, str]]:
     """
-    From a selected territorial unit page (typically ps32?...),
-    parse municipalities: (code, name, results_url).
+    Parse municipality list from ps32 page.
+    Returns list of (code, name, detail_url).
     """
     soup = fetch_soup(unit_url)
     out: List[Tuple[str, str, str]] = []
@@ -87,24 +47,17 @@ def parse_municipalities(unit_url: str) -> List[Tuple[str, str, str]]:
         if len(tds) < 2:
             continue
 
-        # code + name are typically first two columns
-        code_a = tds[0].find("a")
-        code = code_a.get_text(strip=True) if code_a else tds[0].get_text(strip=True)
-        if not code.isdigit():
+        a = tds[0].find("a")
+        code = (a.get_text(strip=True) if a else tds[0].get_text(strip=True)).strip()
+        if not code.isdigit() or not a or not a.get("href"):
             continue
 
         name = tds[1].get_text(" ", strip=True)
-        link = find_muni_link(tr, unit_url)
-        if not link:
-            continue
-
-        out.append((code, name, link))
+        detail_url = urljoin(unit_url, a["href"])
+        out.append((code, name, detail_url))
 
     if not out:
-        raise ValueError(
-            "Nepodařilo se najít obce. Zadej odkaz na územní celek, "
-            "který obsahuje tabulku obcí (typicky ps32?... v /ps2017nss/)."
-        )
+        raise ValueError("Očekávám odkaz na stránku se seznamem obcí (ps32... v ps2017nss).")
     return out
 
 
@@ -112,74 +65,57 @@ def parse_summary(soup: BeautifulSoup) -> Dict[str, int]:
     """Parse registered/envelopes/valid from municipality detail page."""
     def get(headers_id: str) -> int:
         td = soup.find("td", attrs={"headers": headers_id})
-        return clean_int(td.get_text(strip=True)) if td else 0
+        return int(to_digits(td.get_text(strip=True))) if td else 0
 
-    # Volby.cz PS stránky běžně používají tyto identifikátory:
     return {"registered": get("sa2"), "envelopes": get("sa3"), "valid": get("sa6")}
-
 
 def parse_parties(soup: BeautifulSoup) -> List[Tuple[int, str, int]]:
     """
-    Parse party results robustly for ps2017nss pages.
-    Uses 'headers' attribute (which is a LIST).
+    Parse party results from ps311 (ps2017nss) by table structure:
+    td[0]=party number, td[1]=party name, td[2]=votes, td[3]=percent
     """
     parties: List[Tuple[int, str, int]] = []
-    seen = set()
 
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
-        if not tds:
+        if len(tds) < 3:
             continue
 
-        pno = None
-        pname = None
-        votes = None
-
-        for td in tds:
-            headers = td.get("headers")
-            if not headers:
-                continue
-
-            # headers is a list, e.g. ['t1sa2']
-            for h in headers:
-                # číslo strany
-                if h.endswith("sa1"):
-                    txt = td.get_text(strip=True)
-                    if txt.isdigit():
-                        pno = int(txt)
-
-                # název strany
-                if h.endswith("sb1"):
-                    pname = td.get_text(" ", strip=True)
-
-                # hlasy (POZOR: ne procenta!)
-                if h.endswith("sa2"):
-                    votes = clean_int(td.get_text(strip=True))
-
-        if pno is None or not pname or votes is None:
+        pno_txt = tds[0].get_text(strip=True)
+        if not pno_txt.isdigit():
             continue
 
-        if pno in seen:
+        pname = tds[1].get_text(" ", strip=True)
+        votes_txt = tds[2].get_text(strip=True).replace("\xa0", "").replace(" ", "")
+
+        # votes must be integer; ignore percent like 100,00
+        if not pname or not votes_txt.isdigit():
             continue
-        seen.add(pno)
 
-        parties.append((pno, pname, votes))
+        parties.append((int(pno_txt), pname, int(votes_txt)))
 
-    parties.sort(key=lambda x: x[0])
-    return parties
+    # deduplicate (table is split to part 1 and 2)
+    uniq: Dict[int, Tuple[str, int]] = {}
+    for pno, pname, votes in parties:
+        uniq[pno] = (pname, votes)
+
+    return [(pno, uniq[pno][0], uniq[pno][1]) for pno in sorted(uniq)]
+
+
 
 def scrape(unit_url: str) -> Tuple[List[str], List[Dict[str, object]]]:
-    """Scrape all municipalities for a given territorial unit URL."""
+    """Scrape all municipalities for given territorial unit URL."""
     munis = parse_municipalities(unit_url)
-
-    party_cols: List[str] = []
-    party_seen: Dict[str, bool] = {}
     rows: List[Dict[str, object]] = []
+    party_cols: List[str] = []
 
-    for code, name, detail_url in munis:
+    for i, (code, name, detail_url) in enumerate(munis):
         soup = fetch_soup(detail_url)
         summary = parse_summary(soup)
         parties = parse_parties(soup)
+
+        if i == 0:
+            party_cols = [pname for _, pname, _ in parties]
 
         row: Dict[str, object] = {
             "code": code,
@@ -188,12 +124,8 @@ def scrape(unit_url: str) -> Tuple[List[str], List[Dict[str, object]]]:
             "envelopes": summary["envelopes"],
             "valid": summary["valid"],
         }
-
         for _, pname, votes in parties:
             row[pname] = votes
-            if pname not in party_seen:
-                party_seen[pname] = True
-                party_cols.append(pname)
 
         rows.append(row)
 
@@ -202,9 +134,9 @@ def scrape(unit_url: str) -> Tuple[List[str], List[Dict[str, object]]]:
 
 
 def write_csv(path: str, header: List[str], rows: List[Dict[str, object]]) -> None:
-    """Write CSV with missing party values filled with 0."""
+    """Write CSV output (semicolon delimiter like in Engeto example)."""
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
+        w = csv.DictWriter(f, fieldnames=header, delimiter=";", extrasaction="ignore")
         w.writeheader()
         for r in rows:
             for col in header:
@@ -223,6 +155,10 @@ def main(argv: List[str]) -> int:
         return 1
 
     unit_url, out_csv = argv[1], argv[2]
+    if "volby.cz/pls/ps2017nss/ps32" not in unit_url:
+        print("Chyba: první argument musí být odkaz na územní celek (ps32... v ps2017nss).", file=sys.stderr)
+        return 1
+
     try:
         header, rows = scrape(unit_url)
         write_csv(out_csv, header, rows)
@@ -239,3 +175,4 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
