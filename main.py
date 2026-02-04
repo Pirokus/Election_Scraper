@@ -29,11 +29,19 @@ def fetch_soup(url: str) -> BeautifulSoup:
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
-
 def clean_int(text: str) -> int:
-    """Convert '1 234' / '1\xa0234' to int."""
+    """Convert numbers like '1 234', '1\xa0234' or '100,00' to int."""
     s = text.replace("\xa0", "").replace(" ", "").strip()
+    if not s:
+        return 0
+    # handle european decimals like 100,00
+    if "," in s and s.replace(",", "").isdigit():
+        s = s.split(",", 1)[0]
+        return int(s) if s else 0
+    # handle unexpected non-digits safely
+    s = "".join(ch for ch in s if ch.isdigit())
     return int(s) if s else 0
+
 
 
 def find_muni_link(tr: BeautifulSoup, base_url: str) -> str:
@@ -111,32 +119,54 @@ def parse_summary(soup: BeautifulSoup) -> Dict[str, int]:
 
 
 def parse_parties(soup: BeautifulSoup) -> List[Tuple[int, str, int]]:
-    """Parse party results: list of (party_no, party_name, votes)."""
+    """
+    Parse party results robustly for ps2017nss pages.
+    Uses 'headers' attribute (which is a LIST).
+    """
     parties: List[Tuple[int, str, int]] = []
+    seen = set()
 
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) < 3:
+        if not tds:
             continue
 
-        no_txt = tds[0].get_text(strip=True)
-        if not no_txt.isdigit():
+        pno = None
+        pname = None
+        votes = None
+
+        for td in tds:
+            headers = td.get("headers")
+            if not headers:
+                continue
+
+            # headers is a list, e.g. ['t1sa2']
+            for h in headers:
+                # číslo strany
+                if h.endswith("sa1"):
+                    txt = td.get_text(strip=True)
+                    if txt.isdigit():
+                        pno = int(txt)
+
+                # název strany
+                if h.endswith("sb1"):
+                    pname = td.get_text(" ", strip=True)
+
+                # hlasy (POZOR: ne procenta!)
+                if h.endswith("sa2"):
+                    votes = clean_int(td.get_text(strip=True))
+
+        if pno is None or not pname or votes is None:
             continue
 
-        name = tds[1].get_text(" ", strip=True)
-        votes_txt = tds[2].get_text(strip=True)
-        if not name:
+        if pno in seen:
             continue
+        seen.add(pno)
 
-        parties.append((int(no_txt), name, clean_int(votes_txt)))
+        parties.append((pno, pname, votes))
 
-    # merge duplicates (výsledky bývají ve 2 tabulkách)
-    merged: Dict[int, Tuple[str, int]] = {}
-    for pno, pname, votes in parties:
-        merged[pno] = (pname, votes)
-
-    return [(pno, merged[pno][0], merged[pno][1]) for pno in sorted(merged)]
-
+    parties.sort(key=lambda x: x[0])
+    return parties
 
 def scrape(unit_url: str) -> Tuple[List[str], List[Dict[str, object]]]:
     """Scrape all municipalities for a given territorial unit URL."""
